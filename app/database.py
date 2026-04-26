@@ -13,7 +13,6 @@ MENU = [
 
 VALID_INGREDIENTS = {"водка", "ром", "текила", "виски", "джин", "кола", "сок", "тоник", "лёд", "молоко"}
 
-# Ранги по количеству уникальных напитков
 RANKS = [
     (8,  "Легенда"),
     (6,  "Эксперт"),
@@ -37,6 +36,19 @@ def get_favorite_drink(history: list):
         name = order["drink"]
         counts[name] = counts.get(name, 0) + 1
     return max(counts, key=counts.get)
+
+
+def make_user():
+    return {
+        "id": None,
+        "balance": 100,
+        "mood": "normal",
+        "history": [],
+        "unique": set(),
+        "total_tips": 0,
+        "failed_recipes": 0,
+        "used_promos": set(),   # ← новое поле для промокодов
+    }
 
 
 # In-memory DB
