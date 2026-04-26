@@ -1,91 +1,70 @@
 # app/routes.py
 from flask import Blueprint, request, jsonify
 import uuid
-from .database import MENU, VALID_INGREDIENTS, users_db, get_rank, get_favorite_drink
+from .database import (
+    MENU, VALID_INGREDIENTS, get_rank, get_favorite_drink,
+    get_user, save_user, count_users, all_users, make_user
+)
 
 bar_bp = Blueprint('bar', __name__)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def get_auth_user():
+    """Возвращает (user_dict, token) или кидает 401."""
     auth = request.headers.get('Authorization', '')
     if not auth.startswith('Bearer '):
-        return None, "unauthorized", 401
+        return None, None, "unauthorized", 401
     token = auth.split(' ', 1)[1].strip()
-    user = users_db.get(token)
+    if not token:
+        return None, None, "unauthorized", 401
+    user = get_user(token)
     if not user:
-        return None, "unauthorized", 401
-    return user, None, None
+        return None, None, "unauthorized", 401
+    return user, token, None, None
 
 
 def get_time_hour():
     x_time = request.headers.get('X-Time', '12:00')
     try:
-        return int(x_time.split(':')[0])
+        return int(str(x_time).split(':')[0])
     except Exception:
         return 12
 
 
 def is_bar_closed():
     hour = get_time_hour()
-    return 0 <= hour <= 5   # полночь–5:59 → закрыто
+    return 0 <= hour <= 5
 
 
-def recalc_mood(user):
-    """Пересчитываем настроение по числу чаевых и истории."""
-    # mood хранится как строка: normal / happy / grumpy
-    # Базовая логика: много tip → happy; unknown_recipe → grumpy; tip сбрасывает grumpy
-    pass  # mood меняется явно в роутах
-
-
-def make_user():
-    return {
-        "id": None,
-        "balance": 100,
-        "mood": "normal",
-        "history": [],
-        "unique": set(),
-        "total_tips": 0,
-        "failed_recipes": 0,
-        "bar_closed": False,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Auth / Account
-# ---------------------------------------------------------------------------
+# ── Auth / Account ────────────────────────────────────────────────────────────
 
 @bar_bp.route('/register', methods=['POST'])
 def register():
     token = uuid.uuid4().hex
-    u_id = f"BAR-{len(users_db) + 1:04d}"
-    user = make_user()
-    user["id"] = u_id
-    users_db[token] = user
+    u_id = f"BAR-{count_users() + 1:04d}"
+    user = make_user(u_id)
+    save_user(token, user)
     return jsonify({"status": "ok", "id": u_id, "token": token})
 
 
 @bar_bp.route('/reset', methods=['POST'])
 def reset():
-    user, err, code = get_auth_user()
+    user, token, err, code = get_auth_user()
     if err:
         return jsonify({"status": "error", "error": err}), code
     uid = user["id"]
-    user.update(make_user())
-    user["id"] = uid
+    fresh = make_user(uid)
+    save_user(token, fresh)
     return jsonify({"status": "ok"})
 
 
-# ---------------------------------------------------------------------------
-# Menu
-# ---------------------------------------------------------------------------
+# ── Menu ─────────────────────────────────────────────────────────────────────
 
 @bar_bp.route('/menu', methods=['GET'])
 def menu():
-    user, err, code = get_auth_user()
+    user, token, err, code = get_auth_user()
     if err:
         return jsonify({"status": "error", "error": err}), code
 
@@ -101,22 +80,18 @@ def menu():
     return jsonify(resp)
 
 
-# ---------------------------------------------------------------------------
-# Order
-# ---------------------------------------------------------------------------
+# ── Order ─────────────────────────────────────────────────────────────────────
 
 @bar_bp.route('/order', methods=['POST'])
 def order():
-    user, err, code = get_auth_user()
+    user, token, err, code = get_auth_user()
     if err:
         return jsonify({"status": "error", "error": err}), code
 
     if is_bar_closed():
         return jsonify({
-            "status": "error",
-            "error": "bar_closed",
-            "balance": user["balance"],
-            "mood_level": user["mood"],
+            "status": "error", "error": "bar_closed",
+            "balance": user["balance"], "mood_level": user["mood"],
         }), 403
 
     data = request.get_json(silent=True) or {}
@@ -125,14 +100,11 @@ def order():
 
     if not drink:
         return jsonify({
-            "status": "error",
-            "error": "unknown_drink",
-            "balance": user["balance"],
-            "mood_level": user["mood"],
+            "status": "error", "error": "unknown_drink",
+            "balance": user["balance"], "mood_level": user["mood"],
         })
 
     price = drink["price"]
-    # Настроение влияет на цену: grumpy → наценка, happy → скидка
     if user["mood"] == "happy":
         price = max(1, price - 1)
     elif user["mood"] == "grumpy":
@@ -140,60 +112,48 @@ def order():
 
     if user["balance"] < price:
         return jsonify({
-            "status": "error",
-            "error": "insufficient_funds",
-            "price": price,
-            "balance": user["balance"],
-            "mood_level": user["mood"],
+            "status": "error", "error": "insufficient_funds",
+            "price": price, "balance": user["balance"], "mood_level": user["mood"],
         })
 
     user["balance"] -= price
     user["history"].append({"drink": drink["name"], "price": price, "method": "order"})
     user["unique"].add(drink["name"])
 
-    # После каждых 5 заказов бармен чуть добреет
     if len(user["history"]) % 5 == 0 and user["mood"] == "grumpy":
         user["mood"] = "normal"
 
+    save_user(token, user)
     return jsonify({
-        "status": "ok",
-        "drink": drink["name"],
-        "price": price,
-        "balance": user["balance"],
-        "mood_level": user["mood"],
+        "status": "ok", "drink": drink["name"],
+        "price": price, "balance": user["balance"], "mood_level": user["mood"],
     })
 
 
-# ---------------------------------------------------------------------------
-# Mix
-# ---------------------------------------------------------------------------
+# ── Mix ───────────────────────────────────────────────────────────────────────
 
 @bar_bp.route('/mix', methods=['POST'])
 def mix():
-    user, err, code = get_auth_user()
+    user, token, err, code = get_auth_user()
     if err:
         return jsonify({"status": "error", "error": err}), code
 
     if is_bar_closed():
         return jsonify({
-            "status": "error",
-            "error": "bar_closed",
-            "balance": user["balance"],
-            "mood_level": user["mood"],
+            "status": "error", "error": "bar_closed",
+            "balance": user["balance"], "mood_level": user["mood"],
         }), 403
 
     data = request.get_json(silent=True) or {}
     ingredients = data.get("ingredients", [])
 
-    # Валидация ингредиентов
     for ing in ingredients:
         if ing not in VALID_INGREDIENTS:
             user["mood"] = "grumpy"
+            save_user(token, user)
             return jsonify({
-                "status": "error",
-                "error": "unknown_ingredient",
-                "balance": user["balance"],
-                "mood_level": user["mood"],
+                "status": "error", "error": "unknown_ingredient",
+                "balance": user["balance"], "mood_level": user["mood"],
             })
 
     ingr_sorted = sorted(ingredients)
@@ -202,15 +162,13 @@ def mix():
     if not drink:
         user["mood"] = "grumpy"
         user["failed_recipes"] = user.get("failed_recipes", 0) + 1
+        save_user(token, user)
         return jsonify({
-            "status": "error",
-            "error": "unknown_recipe",
-            "balance": user["balance"],
-            "mood_level": user["mood"],
+            "status": "error", "error": "unknown_recipe",
+            "balance": user["balance"], "mood_level": user["mood"],
         })
 
     mix_price = max(1, drink["price"] - 2)
-    # Настроение тоже влияет на микс
     if user["mood"] == "happy":
         mix_price = max(1, mix_price - 1)
     elif user["mood"] == "grumpy":
@@ -218,45 +176,36 @@ def mix():
 
     if user["balance"] < mix_price:
         return jsonify({
-            "status": "error",
-            "error": "insufficient_funds",
-            "price": mix_price,
-            "balance": user["balance"],
-            "mood_level": user["mood"],
+            "status": "error", "error": "insufficient_funds",
+            "price": mix_price, "balance": user["balance"], "mood_level": user["mood"],
         })
 
     user["balance"] -= mix_price
     user["history"].append({"drink": drink["name"], "price": mix_price, "method": "mix"})
     user["unique"].add(drink["name"])
 
+    save_user(token, user)
     return jsonify({
-        "status": "ok",
-        "drink": drink["name"],
-        "price": mix_price,
-        "balance": user["balance"],
-        "mood_level": user["mood"],
+        "status": "ok", "drink": drink["name"],
+        "price": mix_price, "balance": user["balance"], "mood_level": user["mood"],
     })
 
 
-# ---------------------------------------------------------------------------
-# Balance
-# ---------------------------------------------------------------------------
+# ── Balance ───────────────────────────────────────────────────────────────────
 
 @bar_bp.route('/balance', methods=['GET'])
 def get_balance():
-    user, err, code = get_auth_user()
+    user, token, err, code = get_auth_user()
     if err:
         return jsonify({"status": "error", "error": err}), code
     return jsonify({"status": "ok", "balance": user["balance"], "mood_level": user["mood"]})
 
 
-# ---------------------------------------------------------------------------
-# Tip
-# ---------------------------------------------------------------------------
+# ── Tip ───────────────────────────────────────────────────────────────────────
 
 @bar_bp.route('/tip', methods=['POST'])
 def tip():
-    user, err, code = get_auth_user()
+    user, token, err, code = get_auth_user()
     if err:
         return jsonify({"status": "error", "error": err}), code
 
@@ -265,54 +214,44 @@ def tip():
 
     if not isinstance(amount, (int, float)) or amount <= 0:
         return jsonify({
-            "status": "error",
-            "error": "invalid_amount",
-            "balance": user["balance"],
-            "mood_level": user["mood"],
+            "status": "error", "error": "invalid_amount",
+            "balance": user["balance"], "mood_level": user["mood"],
         })
 
     user["balance"] -= amount
     user["total_tips"] = user.get("total_tips", 0) + amount
 
-    # Чаевые улучшают настроение
     total = user["total_tips"]
     if total >= 20:
         user["mood"] = "happy"
     elif user["mood"] == "grumpy":
-        user["mood"] = "normal"  # любые чаевые снимают grumpy
+        user["mood"] = "normal"
 
+    save_user(token, user)
     return jsonify({
-        "status": "ok",
-        "tip": amount,
-        "balance": user["balance"],
-        "mood_level": user["mood"],
+        "status": "ok", "tip": amount,
+        "balance": user["balance"], "mood_level": user["mood"],
     })
 
 
-# ---------------------------------------------------------------------------
-# History
-# ---------------------------------------------------------------------------
+# ── History ───────────────────────────────────────────────────────────────────
 
 @bar_bp.route('/history', methods=['GET'])
 def get_history():
-    user, err, code = get_auth_user()
+    user, token, err, code = get_auth_user()
     if err:
         return jsonify({"status": "error", "error": err}), code
     return jsonify({
-        "status": "ok",
-        "orders": user["history"],
-        "balance": user["balance"],
-        "mood_level": user["mood"],
+        "status": "ok", "orders": user["history"],
+        "balance": user["balance"], "mood_level": user["mood"],
     })
 
 
-# ---------------------------------------------------------------------------
-# Profile
-# ---------------------------------------------------------------------------
+# ── Profile ───────────────────────────────────────────────────────────────────
 
 @bar_bp.route('/profile', methods=['GET'])
 def profile():
-    user, err, code = get_auth_user()
+    user, token, err, code = get_auth_user()
     if err:
         return jsonify({"status": "error", "error": err}), code
 
@@ -331,13 +270,10 @@ def profile():
     })
 
 
-# ---------------------------------------------------------------------------
-# Hidden / Secret endpoints (reverse-engineered from task hints)
-# ---------------------------------------------------------------------------
+# ── Hidden endpoints ──────────────────────────────────────────────────────────
 
 @bar_bp.route('/status', methods=['GET'])
 def status():
-    """Скрытый статус бара."""
     hour = get_time_hour()
     closed = is_bar_closed()
     return jsonify({
@@ -350,8 +286,7 @@ def status():
 
 @bar_bp.route('/mood', methods=['GET'])
 def mood():
-    """Скрытый эндпоинт — узнать настроение напрямую."""
-    user, err, code = get_auth_user()
+    user, token, err, code = get_auth_user()
     if err:
         return jsonify({"status": "error", "error": err}), code
     messages = {
@@ -368,14 +303,13 @@ def mood():
 
 @bar_bp.route('/cheat', methods=['POST'])
 def cheat():
-    """Пасхалка: попытка сжульничать."""
-    user, err, code = get_auth_user()
+    user, token, err, code = get_auth_user()
     if err:
         return jsonify({"status": "error", "error": err}), code
     user["mood"] = "grumpy"
+    save_user(token, user)
     return jsonify({
-        "status": "error",
-        "error": "caught_cheating",
+        "status": "error", "error": "caught_cheating",
         "message": "Бармен всё видит. Настроение испорчено.",
         "mood_level": user["mood"],
     }), 418
@@ -383,32 +317,25 @@ def cheat():
 
 @bar_bp.route('/secret', methods=['GET'])
 def secret():
-    """Секретный эндпоинт с паролем."""
-    user, err, code = get_auth_user()
+    user, token, err, code = get_auth_user()
     if err:
         return jsonify({"status": "error", "error": err}), code
 
     password = request.args.get('password') or (request.get_json(silent=True) or {}).get('password')
     if password == 'blackbar':
         user["balance"] += 50
+        save_user(token, user)
         return jsonify({
             "status": "ok",
             "message": "Знаешь пароль — заслужил угощение.",
-            "bonus": 50,
-            "balance": user["balance"],
-            "mood_level": user["mood"],
+            "bonus": 50, "balance": user["balance"], "mood_level": user["mood"],
         })
-    return jsonify({
-        "status": "error",
-        "error": "wrong_password",
-        "mood_level": user["mood"],
-    })
+    return jsonify({"status": "error", "error": "wrong_password", "mood_level": user["mood"]})
 
 
 @bar_bp.route('/ingredients', methods=['GET'])
 def ingredients():
-    """Список всех ингредиентов."""
-    user, err, code = get_auth_user()
+    user, token, err, code = get_auth_user()
     if err:
         return jsonify({"status": "error", "error": err}), code
     return jsonify({
@@ -420,13 +347,12 @@ def ingredients():
 
 @bar_bp.route('/top', methods=['GET'])
 def top():
-    """Топ напитков (скрытый рейтинг)."""
-    user, err, code = get_auth_user()
+    user, token, err, code = get_auth_user()
     if err:
         return jsonify({"status": "error", "error": err}), code
 
-    counts = {}
-    for u in users_db.values():
+    counts: dict[str, int] = {}
+    for u in all_users():
         for order in u.get("history", []):
             name = order["drink"]
             counts[name] = counts.get(name, 0) + 1
@@ -439,9 +365,7 @@ def top():
     })
 
 
-# ---------------------------------------------------------------------------
-# 404 handler
-# ---------------------------------------------------------------------------
+# ── Error handlers ────────────────────────────────────────────────────────────
 
 @bar_bp.app_errorhandler(404)
 def not_found(e):
